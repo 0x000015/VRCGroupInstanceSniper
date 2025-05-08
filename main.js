@@ -5,18 +5,58 @@ const fs = require("fs");
 const path = require("path");
 
 const configPath = path.join(__dirname, "config.json");
+var delayCancel = null;
+var reduceDelay = false;
 
 const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+readline.emitKeypressEvents(process.stdin);
+if (process.stdin.isTTY)
+    process.stdin.setRawMode(true);
 const askPrompt = (query) => new Promise((resolve) => rl.question(query, resolve));
-const Delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+
+const Delay = ms => new Promise(resolve => { delayCancel = resolve; setTimeout(() => { delayCancel = null; resolve(); }, ms); });
+let fastModeLogged = false;
+let spaceTimeout = null;
+
+// TODO: Cleanup
+process.stdin.on("keypress", (str, key) => {
+    if (key.name === "space") {
+        // Prevent terminal from printing the space
+        if (str === ' ')
+            process.stdout.write('\x08');
+
+        // Enter fast mode
+        reduceDelay = true;
+
+        if (!fastModeLogged) {
+            console.log("[Spacebar Held] Fast mode enabled");
+            fastModeLogged = true;
+        }
+
+        if (delayCancel) {
+            delayCancel();
+            delayCancel = null;
+        }
+
+        // Reset to slow mode after 1 second
+        if (spaceTimeout)
+            clearTimeout(spaceTimeout);
+        spaceTimeout = setTimeout(() => {
+            reduceDelay = false;
+            fastModeLogged = false;
+            console.log("[Spacebar Released] Fast mode disabled");
+        }, 1000);
+    }
+});
 
 var localConfig = {
     Username: "",
     Password: "",
     GroupID: "",
     AuthCookie: "",
-    ul: 0,
-    pl: 0,
+    //ul: 0,
+    //pl: 0,
 }
 
 async function main() {
@@ -25,9 +65,9 @@ async function main() {
         username: localConfig.Username,
         password: localConfig.Password,
         baseOptions: {
-            headers: { 
-                "User-Agent": "InstanceJoiner/1.0.0",
-             }
+            headers: {
+                "User-Agent": "InstanceJoiner/1.1.0",
+            }
         }
     });
 
@@ -35,25 +75,39 @@ async function main() {
     if (localConfig.AuthCookie)
         vrcConfig.baseOptions.headers.Cookie = `auth=${localConfig.AuthCookie}`;
 
-    const groupAPI = new vrchat.GroupsApi(vrcConfig);
-    const inviteAPI = new vrchat.InviteApi(vrcConfig);
-    await Login(vrcConfig);
-    const groupData = await getGroupData(groupAPI);
-    
-    // Loop through specified group instances
-    // TODO: Add support for multiple groups as well as time priority for events
     while (true) {
-        const group = await getGroupInstances(groupAPI)
-        if (group != null && group.length > 0) {
-            console.log(`Sent invite for '${groupData.name}(${group[0].world.name})' with '${group[0].memberCount}' members in`)
-            await inviteAPI.inviteMyselfTo(group[0].world.id, group[0].instanceId)
-            return
-        } else {
-            console.log(`No group instances found for ${groupData.name}`, group)
+        try {
+            await Login(vrcConfig);
+            break;
+        } catch (err) {
+            console.log("Failed to login. Verify credentials and try again.", err)
+            await handleConfig(true)
+            vrcConfig.username = localConfig.Username
+            vrcConfig.password = localConfig.Password
         }
-        await Delay(1000)
     }
 
+    const groupAPI = new vrchat.GroupsApi(vrcConfig);
+    const inviteAPI = new vrchat.InviteApi(vrcConfig);
+    const groupData = await getGroupData(groupAPI);
+
+    // Loop through specified group instances constantly
+    while (true) {
+        const groups = await getGroupInstances(groupAPI)
+        if (groups.length === 0) {
+            console.warn(`No group instances found for '${groupData.name}'`)
+        } else { // If we found some instances, then invite us to each of them, and then break off
+            for (let i = 0; i < groups.length; i++) {
+                const group = groups[i];
+                console.log(`Sent invite for '${groupData.name}(${group.world.name})' with '${group.memberCount}' members in`)
+                await inviteAPI.inviteMyselfTo(group.world.id, group.instanceId)
+            }
+            console.log(`Finished sending invites. Closing`);
+            Delay(1500)
+        }
+        // Wait either 1 sec, which seems to be safe for ratelimits, or 200ms if we're rushing the invites. We can only do this for about a 30 seconds before we get blocked temporarily
+        await Delay(reduceDelay ? 200 : 1000)
+    }
 }
 
 
@@ -86,8 +140,7 @@ async function Login(vrcConfig) {
             saveConfig();
         }
     }
-    console.log(`Logged in as: ${currentUser.displayName}`);
-    
+    console.log(`Logged in as '${currentUser.displayName}'`);
 }
 
 // (no this is not secure, it's not trying to be)
@@ -101,9 +154,9 @@ function deobf(encoded) {
     return xored.toString("utf8");
 }
 
-async function handleConfig() {
+async function handleConfig(forceConfig = false) {
     // If no config file exists, prompt the user for their credentials
-    if (!fs.existsSync(configPath)) {
+    if (forceConfig || !fs.existsSync(configPath)) {
         console.log("No config found. Please enter credentials.");
 
         await promptForConfig();
@@ -112,24 +165,29 @@ async function handleConfig() {
     localConfig = JSON.parse(fs.readFileSync(configPath, "utf8"));
 
     // Decrypt credentials if obfuscated
-    if (localConfig.Username) localConfig.Username = deobf(localConfig.Username);
-    if (localConfig.Password) localConfig.Password = deobf(localConfig.Password);
-    if (localConfig.AuthCookie) localConfig.AuthCookie = deobf(localConfig.AuthCookie);
+    if (localConfig.Username)
+        localConfig.Username = deobf(localConfig.Username);
+    if (localConfig.Password)
+        localConfig.Password = deobf(localConfig.Password);
+    if (localConfig.AuthCookie)
+        localConfig.AuthCookie = deobf(localConfig.AuthCookie);
 
-    validateConfigLength();
+    //validateConfigLength();
 }
 
 async function promptForConfig() {
     // Loop through changable entries
     for (const field of ["Username", "Password", "GroupID"]) {
-        if (!localConfig[field]) {
+        //if (!localConfig[field]) {
             const answer = await askPrompt(`Enter ${field}: `);
             localConfig[field] = answer
 
             // Store username/password lengths for validation later
-            if (field === "Username") localConfig.ul = answer.length;
-            if (field === "Password") localConfig.pl = answer.length;
-        }
+            /*if (field === "Username") 
+                localConfig.ul = answer.length;
+            if (field === "Password") 
+                localConfig.pl = answer.length;*/
+        //}
     }
 }
 
@@ -144,14 +202,14 @@ async function saveConfig() {
 }
 
 // Validate the username/password lengths against stored values
-function validateConfigLength() {
+/*function validateConfigLength() {
     if (localConfig.ul !== localConfig.Username.length) {
         console.log("Username length mismatch");
     }
     if (localConfig.pl !== localConfig.Password.length) {
         console.log("Password length mismatch");
     }
-}
+}*/
 
 async function getGroupInstances(groupAPI) {
     let group;
