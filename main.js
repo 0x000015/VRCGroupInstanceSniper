@@ -55,18 +55,18 @@ var localConfig = {
     Password: "",
     GroupID: "",
     AuthCookie: "",
-    //ul: 0,
-    //pl: 0,
+    PriorityTimeStart: "",
+    PriorityTimeEnd: "",
 }
 
 async function main() {
     await handleConfig()
-    var vrcConfig = new vrchat.Configuration({
+    let vrcConfig = new vrchat.Configuration({
         username: localConfig.Username,
         password: localConfig.Password,
         baseOptions: {
             headers: {
-                "User-Agent": "InstanceJoiner/1.1.0",
+                "User-Agent": "InstanceJoiner/1.2.0",
             }
         }
     });
@@ -93,6 +93,8 @@ async function main() {
 
     // Loop through specified group instances constantly
     while (true) {
+        const date = new Date();
+        const curTime = date.getHours() * 60 + date.getMinutes();
         const groups = await getGroupInstances(groupAPI)
         if (groups.length === 0) {
             console.warn(`No group instances found for '${groupData.name}'`)
@@ -104,9 +106,10 @@ async function main() {
             }
             console.log(`Finished sending invites. Closing`);
             Delay(1500)
+            return;
         }
-        // Wait either 1 sec, which seems to be safe for ratelimits, or 200ms if we're rushing the invites. We can only do this for about a 30 seconds before we get blocked temporarily
-        await Delay(reduceDelay ? 200 : 1000)
+        // Wait either 1.5 sec, which seems to be safe for ratelimits, or 200ms if we're rushing the invites. We can only do this for about a 30 seconds before we get blocked temporarily
+        await Delay(reduceDelay || shouldPrioritize(localConfig.PriorityTimeStart, localConfig.PriorityTimeEnd, curTime) ? 200 : 1500)
     }
 }
 
@@ -114,6 +117,7 @@ async function main() {
 async function Login(vrcConfig) {
     const authenticationApi = new vrchat.AuthenticationApi(vrcConfig);
     let currentUser;
+
     try {
         currentUser = (await authenticationApi.getCurrentUser()).data;
     } catch (err) {
@@ -159,10 +163,9 @@ async function handleConfig(forceConfig = false) {
     if (forceConfig || !fs.existsSync(configPath)) {
         console.log("No config found. Please enter credentials.");
 
-        await promptForConfig();
-        await saveConfig();
     }
     localConfig = JSON.parse(fs.readFileSync(configPath, "utf8"));
+    await promptForConfig(forceConfig);
 
     // Decrypt credentials if obfuscated
     if (localConfig.Username)
@@ -171,28 +174,41 @@ async function handleConfig(forceConfig = false) {
         localConfig.Password = deobf(localConfig.Password);
     if (localConfig.AuthCookie)
         localConfig.AuthCookie = deobf(localConfig.AuthCookie);
+    if (localConfig.PriorityTimeStart !== undefined && !Number.isInteger(localConfig.PriorityTimeStart))
+        localConfig.PriorityTimeStart = parseTimeToMinutes(localConfig.PriorityTimeStart)
+    if (localConfig.PriorityTimeEnd !== undefined && !Number.isInteger(localConfig.PriorityTimeEnd))
+        localConfig.PriorityTimeEnd = parseTimeToMinutes(localConfig.PriorityTimeEnd)
 
     //validateConfigLength();
 }
 
-async function promptForConfig() {
-    // Loop through changable entries
-    for (const field of ["Username", "Password", "GroupID"]) {
-        //if (!localConfig[field]) {
-            const answer = await askPrompt(`Enter ${field}: `);
-            localConfig[field] = answer
+async function promptForConfig(forceConfig) {
+    if (forceConfig) {
 
-            // Store username/password lengths for validation later
-            /*if (field === "Username") 
-                localConfig.ul = answer.length;
-            if (field === "Password") 
-                localConfig.pl = answer.length;*/
-        //}
     }
+    let shouldSave = false;
+    const entries = [
+        ["Username", "", true],
+        ["Password", "", true],
+        ["GroupID", ""],
+        ["PriorityTimeStart", "When should we automatically start rushing checks for group instances (Example: 12:00 AM)"],
+        ["PriorityTimeEnd", "When should we automatically stop rushing checks for group instances (Example: 12:05 AM)"]]
+    // Loop through changable entries
+    for (const fields of entries) {
+        let [param, desc, force] = fields;
+        // This'll skip if we already have the field set
+        if ((force && localConfig[param] !== undefined && !forceConfig) || !force && localConfig[param] !== undefined)
+            continue
+        const answer = await askPrompt(`Enter ${param} ${fields[1] !== "" ? `[${desc}]` : ""} `);
+        localConfig[param] = answer
+        shouldSave = true;
+    }
+    if (shouldSave)
+        saveConfig();
 }
 
 async function saveConfig() {
-    var tmpConfig = localConfig;
+    let tmpConfig = localConfig;
 
     tmpConfig.AuthCookie = obf(tmpConfig.AuthCookie);
     tmpConfig.Username = obf(tmpConfig.Username);
@@ -201,29 +217,21 @@ async function saveConfig() {
     console.log("Saved config");
 }
 
-// Validate the username/password lengths against stored values
-/*function validateConfigLength() {
-    if (localConfig.ul !== localConfig.Username.length) {
-        console.log("Username length mismatch");
-    }
-    if (localConfig.pl !== localConfig.Password.length) {
-        console.log("Password length mismatch");
-    }
-}*/
-
 async function getGroupInstances(groupAPI) {
-    let group;
+    let groupInstances;
+
     try {
-        group = (await groupAPI.getGroupInstances(localConfig.GroupID)).data;
+        groupInstances = (await groupAPI.getGroupInstances(localConfig.GroupID)).data;
     } catch (err) {
         console.log('Failed to get group instances', err);
         return null;
     }
-    return group
+    return groupInstances
 }
 
 async function getGroupData(groupAPI) {
     let groupData;
+
     try {
         groupData = (await groupAPI.getGroup(localConfig.GroupID)).data;
     } catch (err) {
@@ -231,5 +239,32 @@ async function getGroupData(groupAPI) {
         return null;
     }
     return groupData
+}
+
+// Speciality just for time priority
+function parseTimeToMinutes(timeStr) {
+    const match = timeStr.match(/^(0?[1-9]|1[0-2]):([0-5][0-9])\s?(AM|PM)$/i);
+    if (!match)
+        return null;
+
+    let [, hour, minute, meridiem] = match;
+    hour = parseInt(hour);
+    minute = parseInt(minute);
+    meridiem = meridiem.toUpperCase();
+
+    if (meridiem === 'PM' && hour !== 12)
+        hour += 12;
+    if (meridiem === 'AM' && hour === 12)
+        hour = 0;
+
+    return hour * 60 + minute;
+}
+
+
+function shouldPrioritize(start, end, curTime) {
+    if (start <= end)
+        return curTime >= start && curTime <= end;
+    else // Range crosses midnight
+        return curTime >= start || curTime <= end;
 }
 main();
