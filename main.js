@@ -18,10 +18,11 @@ const askPrompt = (query) => new Promise((resolve) => rl.question(query, resolve
 const Delay = ms => new Promise(resolve => { delayCancel = resolve; setTimeout(() => { delayCancel = null; resolve(); }, ms); });
 let fastModeLogged = false;
 let spaceTimeout = null;
+let isReady = false;
 
 // TODO: Cleanup
 process.stdin.on("keypress", (str, key) => {
-    if (key.name === "space") {
+    if (isReady && key.name === "space") {
         // Prevent terminal from printing the space
         if (str === ' ')
             process.stdout.write('\x08');
@@ -91,6 +92,8 @@ async function main() {
     const inviteAPI = new vrchat.InviteApi(vrcConfig);
     const groupData = await getGroupData(groupAPI);
 
+    // Allow keypresses 
+    isReady = true;
     // Loop through specified group instances constantly
     while (true) {
         const date = new Date();
